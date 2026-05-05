@@ -101,6 +101,32 @@ output/
 
 ---
 
+## Validation and stop-on-failure
+
+After each property finishes, the script checks that all 3 PDFs were created on disk. If any are missing, it prints a clear error and stops processing further properties. A summary table is printed at the end showing each property's result.
+
+```
+════════════════════════════════════════════════════════════
+  SUMMARY
+════════════════════════════════════════════════════════════
+  NKL-4        ✓  3/3 PDFs
+  NKL-5        ✗  2/3 PDFs  — missing: NKL-5_ErosionHazard_Off-Road_Off-Trail.pdf
+  NKL-6        ⏭  skipped
+════════════════════════════════════════════════════════════
+```
+
+To re-run only failed properties, point the script at a folder containing just those shapefiles.
+
+---
+
+## Parallel workers
+
+With `--workers 2`, two properties run simultaneously in separate browser windows. Each has its own session and output folder — the `[Stand]` prefix in terminal output keeps them identifiable.
+
+Recommended limit is `--workers 2`. Higher values risk WSS rate-limiting requests and causing timeouts.
+
+---
+
 ## Example – test on a single property
 
 ```bash
@@ -114,13 +140,13 @@ Compare the generated PDFs in `test_output/RRG-2/` against the reference files i
 ## Troubleshooting
 
 **Browser window opens but nothing happens**
-The WSS website can be slow to load. Default timeouts are 60 s for navigation and 120 s for map/report rendering. If your connection is slow, the script will eventually time out and print a `FAILED` message for that property. Re-running usually succeeds.
+The WSS website can be slow on first load, especially for a region that hasn't been recently requested. Default timeouts are 90 s for navigation and 180 s for map/report rendering. If the script times out, re-running usually succeeds as WSS caches recent results server-side.
 
 **"Non-fatal errors creating printable version"**
 WSS sometimes shows this warning after generating a PDF (typically an SVG rendering note). The script automatically dismisses it and the PDF is still valid.
 
 **A property fails but others succeed**
-Each property runs in its own isolated browser context. A failure on one does not affect others. You can re-run the script pointing at a folder containing only the failed property's shapefiles.
+Each property runs in its own isolated browser context. A failure on one stops subsequent properties from starting but does not affect any already in progress. Re-run with a folder containing only the failed property's shapefiles.
 
 **Windows path issues**
 Use forward slashes or quote paths with spaces:
