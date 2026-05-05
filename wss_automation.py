@@ -32,7 +32,6 @@ import re
 import shutil
 import sys
 import tempfile
-import traceback
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -42,9 +41,9 @@ from playwright.async_api import TimeoutError as PWTimeout
 from playwright.async_api import async_playwright
 
 # ── Tuneable timeouts (all in milliseconds) ────────────────────────────────────
-NAV_TIMEOUT    = 60_000    # regular navigation / click waits
-MAP_TIMEOUT    = 120_000   # map tile / report render waits
-SETTLE_MS      = 1_500     # short pause after each UI action
+NAV_TIMEOUT    = 90_000    # regular navigation / click waits
+MAP_TIMEOUT    = 180_000   # map tile / report render waits
+SETTLE_MS      = 2_500     # short pause after each UI action
 
 WSS_URL = "https://websoilsurvey.nrcs.usda.gov/app/WebSoilSurvey.aspx"
 
@@ -88,18 +87,81 @@ def build_zip(files: dict[str, Path], stand: str, dest: Path) -> Path:
 # Low-level WSS page helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
+async def _backdrop_poller(page: Page) -> None:
+    """
+    Background task: polls every 500 ms and dismisses any visible WSS dialog
+    by clicking its close/OK button directly. This is safer than pressing Escape
+    (which WSS also uses to cancel operations like PDF generation).
+
+    Strategy:
+      1. Find any visible div.backdrop
+      2. Derive the dialog element (backdrop ID minus '_backdrop' suffix)
+      3. Find a close/OK button inside the dialog and click it
+      4. Fall back to Escape only if no close button is found
+    """
+    while True:
+        try:
+            await page.evaluate("""() => {
+                const backdrop = Array.from(document.querySelectorAll('div.backdrop'))
+                    .find(e => {
+                        const s = window.getComputedStyle(e);
+                        return s.display !== 'none'
+                            && s.visibility !== 'hidden'
+                            && e.offsetParent !== null;
+                    });
+                if (!backdrop) return;
+
+                // Derive the dialog element from the backdrop ID
+                const dialogId = backdrop.id.replace(/_backdrop$/, '');
+                const dialog = document.getElementById(dialogId) || backdrop.parentElement;
+
+                // Click the first visible close/OK button inside the dialog
+                const btn = Array.from(dialog.querySelectorAll('button, input[type=button], a'))
+                    .find(el => {
+                        const text = (el.value || el.textContent || '').trim().toLowerCase();
+                        const isClose = text === 'ok' || text === 'close'
+                            || text === 'x' || text === '×'
+                            || el.className.toLowerCase().includes('close');
+                        if (!isClose) return false;
+                        const s = window.getComputedStyle(el);
+                        return s.display !== 'none'
+                            && s.visibility !== 'hidden'
+                            && el.offsetParent !== null;
+                    });
+                if (btn) btn.click();
+            }""")
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+
+
 async def dismiss_warning(page: Page) -> None:
-    """
-    Dismiss the WSS 'Non-fatal errors' warning dialog if it appears.
-    The dialog blocks all subsequent clicks; pressing Escape closes it.
-    """
+    """One-shot dismissal — clicks the close button of any visible dialog."""
     try:
-        backdrop = page.locator("#Warning_00000_backdrop")
-        if await backdrop.is_visible(timeout=3_000):
-            await page.keyboard.press("Escape")
-            await backdrop.wait_for(state="hidden", timeout=10_000)
+        visible_id = await page.evaluate("""() => {
+            const backdrop = Array.from(document.querySelectorAll('div.backdrop'))
+                .find(e => {
+                    const s = window.getComputedStyle(e);
+                    return s.display !== 'none'
+                        && s.visibility !== 'hidden'
+                        && e.offsetParent !== null;
+                });
+            if (!backdrop) return null;
+            const dialogId = backdrop.id.replace(/_backdrop$/, '');
+            const dialog = document.getElementById(dialogId) || backdrop.parentElement;
+            const btn = Array.from(dialog.querySelectorAll('button, input[type=button], a'))
+                .find(el => {
+                    const text = (el.value || el.textContent || '').trim().toLowerCase();
+                    return text === 'ok' || text === 'close' || text === 'x' || text === '×'
+                        || el.className.toLowerCase().includes('close');
+                });
+            if (btn) { btn.click(); return backdrop.id; }
+            return null;
+        }""")
+        if visible_id:
+            await page.locator(f"#{visible_id}").wait_for(state="hidden", timeout=10_000)
     except Exception:
-        pass   # dialog may not always appear
+        pass
 
 
 async def wait_map_ready(page: Page) -> None:
@@ -140,27 +202,20 @@ async def save_wss_pdf(page: Page, output_path: Path) -> None:
     pdf_url_future: asyncio.Future[str] = asyncio.get_event_loop().create_future()
 
     async def _on_response(response):
-        if "createprintabledocument" not in response.url:
+        # WSS uses GET (command in URL) or POST (command in body) depending on
+        # map size — catch both by checking any GetScript.dynamic response body
+        # for the OpenExternalWindow PDF call.
+        if "GetScript.dynamic" not in response.url:
+            return
+        if pdf_url_future.done():
             return
         try:
             text = await response.text()
             m = re.search(r"OpenExternalWindow\('(https://[^']+\.pdf)'", text)
-            if m and not pdf_url_future.done():
+            if m:
                 pdf_url_future.set_result(m.group(1))
-            elif not pdf_url_future.done():
-                pdf_url_future.set_exception(
-                    RuntimeError(
-                        f"PDF URL not found in response. First 400: {text[:400]}"
-                    )
-                )
-        except Exception as exc:
-            if not pdf_url_future.done():
-                pdf_url_future.set_exception(exc)
-
-    # Debug: log every response URL for 90 s to see what fires after clicking View
-    async def _debug_all(response):
-        print(f"    [NET] {response.status} {response.url[:120]}")
-    page.on("response", _debug_all)
+        except Exception:
+            pass   # non-PDF GetScript responses are fine; keep waiting
 
     page.on("response", _on_response)
 
@@ -168,29 +223,32 @@ async def save_wss_pdf(page: Page, output_path: Path) -> None:
     await page.wait_for_selector(
         "#controlbarprintbibid_submit_button", state="visible", timeout=NAV_TIMEOUT
     )
-    print("    [DBG] clicking submit button…")
     await page.click("#controlbarprintbibid_submit_button", timeout=NAV_TIMEOUT)
-    print("    [DBG] submit clicked, waiting for response…")
 
-    # 4. Wait for the response listener to resolve the PDF URL (max 90 s)
+    # 4. Wait for the response listener to resolve the PDF URL (max 120 s)
     try:
         pdf_url = await asyncio.wait_for(
-            asyncio.shield(pdf_url_future), timeout=90
+            asyncio.shield(pdf_url_future), timeout=120
         )
     finally:
         page.remove_listener("response", _on_response)
-        page.remove_listener("response", _debug_all)
 
     # 5. Download the PDF via Python urllib (bypasses CORS –
     #    PDF is served from websoilsurvey.sc.egov.usda.gov).
     with urllib.request.urlopen(pdf_url, timeout=120) as resp:
         output_path.write_bytes(resp.read())
 
-    # 6. Dismiss the non-fatal warning WSS shows after PDF generation.
-    #    Also close any PDF tab that OpenExternalWindow may have opened.
-    await dismiss_warning(page)
-    for extra_page in page.context.pages[1:]:   # keep only the main WSS page
+    # 6. Close any PDF tab that OpenExternalWindow may have opened.
+    #    The backdrop poller handles dismissing warning dialogs automatically.
+    for extra_page in page.context.pages[1:]:
         await extra_page.close()
+
+    # 7. Wait for the main page to fully settle before the next interaction.
+    try:
+        await page.wait_for_load_state("networkidle", timeout=15_000)
+    except Exception:
+        pass
+    await page.wait_for_timeout(SETTLE_MS)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -258,8 +316,9 @@ async def click_accordion(page: Page, label: str) -> None:
     otherwise Playwright resolves to the invisible element and times out.
     """
     hdr = page.locator("div.header", has_text=label).first
+    await hdr.wait_for(state="visible", timeout=NAV_TIMEOUT)
     # Only click if the section is currently closed
-    cls = await hdr.get_attribute("class") or ""
+    cls = await hdr.get_attribute("class", timeout=NAV_TIMEOUT) or ""
     if "closed" in cls:
         await hdr.click(timeout=NAV_TIMEOUT)
         await page.wait_for_timeout(SETTLE_MS)
@@ -322,7 +381,12 @@ async def generate_soil_survey(page: Page, stand: str, out_dir: Path) -> None:
     """
     await click_by_text(page, "Soil Map")
     await wait_map_ready(page)
-    await page.wait_for_timeout(3_000)   # extra settle for control bar to render
+    # Wait for all tile/layer requests to finish before interacting with the toolbar
+    try:
+        await page.wait_for_load_state("networkidle", timeout=MAP_TIMEOUT)
+    except Exception:
+        pass
+    await page.wait_for_timeout(2_000)
 
     dest = out_dir / f"{stand}_SoilSurvey.pdf"
     await save_wss_pdf(page, dest)
@@ -341,10 +405,7 @@ async def generate_forestprod(page: Page, stand: str, out_dir: Path) -> None:
     await page.wait_for_timeout(SETTLE_MS)
 
     await click_accordion(page, "Vegetative Productivity")
-
-    # Radio/link for the specific report
-    await page.click("text=Forestland Productivity", timeout=NAV_TIMEOUT)
-    await page.wait_for_timeout(SETTLE_MS)
+    await click_accordion(page, "Forestland Productivity")
 
     await page.click("text=View Soil Report", timeout=NAV_TIMEOUT)
     await page.wait_for_load_state("networkidle", timeout=MAP_TIMEOUT)
@@ -368,9 +429,7 @@ async def generate_erosion_hazard(page: Page, stand: str, out_dir: Path) -> None
     await page.wait_for_timeout(SETTLE_MS)
 
     await click_accordion(page, "Land Management")
-
-    await page.click("text=Erosion Hazard (Off-Road, Off-Trail)", timeout=NAV_TIMEOUT)
-    await page.wait_for_timeout(SETTLE_MS)
+    await click_accordion(page, "Erosion Hazard (Off-Road, Off-Trail)")
 
     await page.click("text=View Rating", timeout=NAV_TIMEOUT)
     await wait_map_ready(page)
@@ -385,20 +444,49 @@ async def generate_erosion_hazard(page: Page, stand: str, out_dir: Path) -> None
 # Per-property orchestrator
 # ══════════════════════════════════════════════════════════════════════════════
 
+_EXPECTED_SUFFIXES = [
+    "_SoilSurvey.pdf",
+    "_forestprod.pdf",
+    "_ErosionHazard_Off-Road_Off-Trail.pdf",
+]
+
+
+def expected_pdfs(stand: str, out_dir: Path) -> list[Path]:
+    return [out_dir / f"{stand}{s}" for s in _EXPECTED_SUFFIXES]
+
+
 async def process_property(
     browser: Browser,
     stand: str,
     files: dict[str, Path],
     output_root: Path,
     semaphore: asyncio.Semaphore,
-) -> None:
-    """Open a fresh browser context, generate all 3 PDFs, then clean up."""
+    stop_event: asyncio.Event,
+) -> dict:
+    """
+    Open a fresh browser context, generate all 3 PDFs, validate, then clean up.
+    Returns a result dict with keys: stand, status, missing, error.
+    Checks stop_event before starting; sets it if validation fails.
+    """
+    # Respect stop signal from a previously failed property
+    if stop_event.is_set():
+        print(f"\n[{stand}]  skipped (earlier property failed validation)")
+        return {"stand": stand, "status": "skipped", "missing": [], "error": None}
+
     async with semaphore:
+        # Re-check after acquiring the semaphore slot (another worker may have
+        # failed while this one was waiting)
+        if stop_event.is_set():
+            print(f"\n[{stand}]  skipped (earlier property failed validation)")
+            return {"stand": stand, "status": "skipped", "missing": [], "error": None}
+
         out_dir = output_root / stand
         out_dir.mkdir(parents=True, exist_ok=True)
 
         tmp = Path(tempfile.mkdtemp())
         context: BrowserContext | None = None
+        error_msg: str | None = None
+
         try:
             zip_path = build_zip(files, stand, tmp)
 
@@ -408,32 +496,76 @@ async def process_property(
             )
             page = await context.new_page()
 
-            print(f"\n[{stand}]  Loading WSS …")
-            await page.goto(WSS_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
-            await page.wait_for_load_state("networkidle", timeout=MAP_TIMEOUT)
+            # Start background poller — dismisses any WSS backdrop dialog
+            # automatically for the entire lifetime of this page.
+            poller = asyncio.create_task(_backdrop_poller(page))
 
-            print(f"[{stand}]  Importing AOI …")
-            await import_aoi(page, zip_path)
+            try:
+                print(f"\n[{stand}]  Loading WSS …")
+                await page.goto(WSS_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+                await page.wait_for_load_state("networkidle", timeout=MAP_TIMEOUT)
 
-            print(f"[{stand}]  Generating PDFs …")
-            await generate_soil_survey(page, stand, out_dir)
-            await generate_forestprod(page, stand, out_dir)
-            await generate_erosion_hazard(page, stand, out_dir)
+                print(f"[{stand}]  Importing AOI …")
+                await import_aoi(page, zip_path)
 
-            print(f"[{stand}]  ✓  All 3 PDFs saved → {out_dir}")
+                print(f"[{stand}]  Generating PDFs …")
+                await generate_soil_survey(page, stand, out_dir)
+                await generate_forestprod(page, stand, out_dir)
+                await generate_erosion_hazard(page, stand, out_dir)
 
-        except Exception as exc:
-            print(f"[{stand}]  ✗  FAILED: {exc}")
-            traceback.print_exc()
+            finally:
+                poller.cancel()
+
+        except BaseException as exc:
+            error_msg = str(exc)
+            print(f"[{stand}]  ✗  Error during generation: {type(exc).__name__}: {exc}")
         finally:
             if context:
                 await context.close()
             shutil.rmtree(tmp, ignore_errors=True)
 
+        # Validate: all 3 PDFs must exist on disk
+        missing = [p for p in expected_pdfs(stand, out_dir) if not p.exists()]
+        if missing:
+            missing_names = [p.name for p in missing]
+            print(f"[{stand}]  ✗  Validation failed — missing: {', '.join(missing_names)}")
+            stop_event.set()
+            return {
+                "stand": stand,
+                "status": "failed",
+                "missing": missing_names,
+                "error": error_msg,
+            }
+
+        print(f"[{stand}]  ✓  All 3 PDFs saved → {out_dir}")
+        return {"stand": stand, "status": "ok", "missing": [], "error": None}
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Entry point
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _print_summary(results: list[dict], all_stands: list[str]) -> None:
+    print("\n" + "═" * 60)
+    print("  SUMMARY")
+    print("═" * 60)
+    reported = {r["stand"] for r in results}
+    for stand in all_stands:
+        if stand not in reported:
+            print(f"  {stand:<12}  ⏭  not started")
+            continue
+        r = next(x for x in results if x["stand"] == stand)
+        if r["status"] == "ok":
+            print(f"  {stand:<12}  ✓  3/3 PDFs")
+        elif r["status"] == "skipped":
+            print(f"  {stand:<12}  ⏭  skipped")
+        else:
+            n = 3 - len(r["missing"])
+            print(f"  {stand:<12}  ✗  {n}/3 PDFs  — missing: {', '.join(r['missing'])}")
+            if r["error"]:
+                print(f"  {'':12}     error  : {r['error'][:120]}")
+    print("═" * 60)
+
 
 async def main(input_dir: Path, output_root: Path, headless: bool, workers: int) -> None:
     properties = find_properties(input_dir)
@@ -441,23 +573,28 @@ async def main(input_dir: Path, output_root: Path, headless: bool, workers: int)
         print(f"ERROR: No *_boundary.shp files found in {input_dir}")
         sys.exit(1)
 
-    print(f"Found {len(properties)} properties: {', '.join(properties)}")
+    all_stands = list(properties.keys())
+    print(f"Found {len(properties)} properties: {', '.join(all_stands)}")
     print(f"Output root : {output_root}")
-    print(f"Headless    : {headless}   Workers: {workers}\n")
+    print(f"Headless    : {headless}   Workers: {workers}")
+    if workers > 2:
+        print("WARNING: WSS may rate-limit with many parallel workers; consider --workers 2")
+    print()
     output_root.mkdir(parents=True, exist_ok=True)
 
     semaphore = asyncio.Semaphore(workers)
+    stop_event = asyncio.Event()
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=headless)
         tasks = [
-            process_property(browser, stand, files, output_root, semaphore)
+            process_property(browser, stand, files, output_root, semaphore, stop_event)
             for stand, files in properties.items()
         ]
-        await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks)
         await browser.close()
 
-    print("\nDone – all properties processed.")
+    _print_summary(list(results), all_stands)
 
 
 def parse_args() -> argparse.Namespace:
